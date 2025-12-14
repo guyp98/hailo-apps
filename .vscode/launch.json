@@ -5,6 +5,14 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "Python Debugger: agent_tools_example",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "hailo_apps/python/gen_ai_apps/agent_tools_example/agent.py",
+            "console": "integratedTerminal",
+            "args": "--voice --log-level debug"
+        },
+        {
             "name": "Python Debugger: Current File with Arguments",
             "type": "debugpy",
             "request": "launch",
