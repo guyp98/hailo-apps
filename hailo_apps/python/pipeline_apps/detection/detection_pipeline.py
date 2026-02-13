@@ -32,6 +32,7 @@ from hailo_apps.python.core.gstreamer.gstreamer_helper_pipelines import (
     SOURCE_PIPELINE,
     TRACKER_PIPELINE,
     USER_CALLBACK_PIPELINE,
+    FAKE_SINK_PIPELINE,
 )
 
 hailo_logger = get_logger(__name__)
@@ -154,13 +155,13 @@ class GStreamerDetectionApp(GStreamerApp):
         display_pipeline = DISPLAY_PIPELINE(
             video_sink=self.video_sink, sync=self.sync, show_fps=self.show_fps
         )
-
+        fake_sink_pipeline = FAKE_SINK_PIPELINE()
         pipeline_string = (
             f"{source_pipeline} ! "
             f"{detection_pipeline_wrapper} ! "
             f"{tracker_pipeline} ! "
             f"{user_callback_pipeline} ! "
-            f"{display_pipeline}"
+            f"{fake_sink_pipeline} "
         )
         hailo_logger.debug("Pipeline string: %s", pipeline_string)
         return pipeline_string

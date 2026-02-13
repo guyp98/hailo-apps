@@ -613,3 +613,17 @@ def UI_APPSINK_PIPELINE(name="ui_sink", sync="true", show_fps="false"):
         f"appsink name={name} sync={sync} drop=true emit-signals=true "
     )
     return ui_appsink_pipeline
+
+
+def FAKE_SINK_PIPELINE(name="fake_sink"):
+    """Creates a GStreamer pipeline string for a fake sink element.
+    This is used for testing purposes when you want to discard the video output.
+
+    Args:
+        name (str, optional): The prefix name for the pipeline elements. Defaults to 'fake_sink'.
+    
+    Returns:
+        str: A string representing the GStreamer pipeline for a fake sink element.
+    """
+    fake_sink_pipeline = f"fakesink name={name} sync=false async=false "
+    return fake_sink_pipeline

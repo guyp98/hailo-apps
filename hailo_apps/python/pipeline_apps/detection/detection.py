@@ -41,6 +41,41 @@ class user_app_callback_class(app_callback_class):
 # -----------------------------------------------------------------------------------------------
 
 
+def _print_red(msg: str):
+    # ANSI 24-bit red
+    print(f"\x1b[38;2;255;0;0m{msg}\x1b[0m")
+
+
+def _get_detection_bbox_xyxy(detection, width, height):
+    """Return (x1,y1,x2,y2) in pixels if bbox is available, else None."""
+    if width is None or height is None:
+        return None
+
+    bbox_fn = getattr(detection, "get_bbox", None)
+    if not callable(bbox_fn):
+        return None
+
+    b = bbox_fn()
+
+    # Prefer HailoBBox method API (normalized)
+    if all(callable(getattr(b, name, None)) for name in ("xmin", "ymin", "xmax", "ymax")):
+        x1 = float(b.xmin())
+        y1 = float(b.ymin())
+        x2 = float(b.xmax())
+        y2 = float(b.ymax())
+        return (int(x1 * width), int(y1 * height), int(x2 * width), int(y2 * height))
+
+    # Fallback: properties
+    if all(hasattr(b, name) for name in ("xmin", "ymin", "xmax", "ymax")):
+        x1 = float(b.xmin)
+        y1 = float(b.ymin)
+        x2 = float(b.xmax)
+        y2 = float(b.ymax)
+        return (int(x1 * width), int(y1 * height), int(x2 * width), int(y2 * height))
+
+    return None
+
+
 def app_callback(element, buffer, user_data):
     if buffer is None:
         hailo_logger.warning("Received None buffer.")
@@ -61,15 +96,71 @@ def app_callback(element, buffer, user_data):
     detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
 
     detection_count = 0
+    line_x = int(0.5 * width) if width is not None else None
     for detection in detections:
         label = detection.get_label()
         confidence = detection.get_confidence()
+
+        xyxy = None
+        is_right = False
+        is_crossing = False
+        if line_x is not None and height is not None:
+            xyxy = _get_detection_bbox_xyxy(detection, width, height)
+            if xyxy is not None:
+                x1, y1, x2, y2 = xyxy
+                is_crossing = x1 <= line_x <= x2
+                # Entire bbox is to the right of the line
+                is_right = x1 >= line_x
+
+        # Red only if fully to the right
+        is_red = is_right
+
+        # Get track ID
+        track_id = 0
+        track = detection.get_objects_typed(hailo.HAILO_UNIQUE_ID)
+        if len(track) == 1:
+            track_id = track[0].get_id()
+
+        if is_crossing:
+            _print_red(
+                f"CROSSED line_x={line_x} | ID={track_id} | Label={label} | Conf={confidence:.2f}"
+            )
+
+        # Draw bbox (frame is RGB here)
+        if frame is not None and xyxy is not None:
+            x1, y1, x2, y2 = xyxy
+            color = (255, 0, 0) if is_red else (0, 255, 0)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+            # Draw track ID label above the box
+            label_text = f"ID:{track_id}"
+            text_scale = 0.6
+            text_thickness = 2
+            (tw, th), baseline = cv2.getTextSize(
+                label_text, cv2.FONT_HERSHEY_SIMPLEX, text_scale, text_thickness
+            )
+            tx = max(0, x1)
+            ty = max(th + 2, y1 - 4)
+            # background for readability
+            cv2.rectangle(
+                frame,
+                (tx, ty - th - baseline - 2),
+                (tx + tw + 6, ty + baseline + 2),
+                color,
+                -1,
+            )
+            cv2.putText(
+                frame,
+                label_text,
+                (tx + 3, ty),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                text_scale,
+                (0, 0, 0),
+                text_thickness,
+                cv2.LINE_AA,
+            )
+
         if label == "person":
-            # Get track ID
-            track_id = 0
-            track = detection.get_objects_typed(hailo.HAILO_UNIQUE_ID)
-            if len(track) == 1:
-                track_id = track[0].get_id()
             string_to_print += (
                 f"Detection: ID: {track_id} Label: {label} Confidence: {confidence:.2f}\n"
             )
@@ -93,6 +184,13 @@ def app_callback(element, buffer, user_data):
             (0, 255, 0),
             2,
         )
+
+        # Draw a vertical reference line overlay (frame is RGB here)
+        if frame is not None and line_x is not None and height is not None:
+            p1 = (line_x, int(0.1 * height))
+            p2 = (line_x, int(0.9 * height))
+            cv2.line(frame, p1, p2, (255, 0, 0), 2)
+
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         user_data.set_frame(frame)
 
