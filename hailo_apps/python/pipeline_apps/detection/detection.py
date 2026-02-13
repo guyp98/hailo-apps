@@ -1,5 +1,6 @@
 # region imports
 # Standard library imports
+import argparse
 
 # Third-party imports
 import gi
@@ -17,6 +18,9 @@ from hailo_apps.python.core.common.buffer_utils import (
     get_numpy_from_buffer,
 )
 
+from hailo_apps.python.core.common.core import (
+    get_pipeline_parser,
+)
 from hailo_apps.python.core.common.hailo_logger import get_logger
 from hailo_apps.python.core.gstreamer.gstreamer_app import app_callback_class
 
@@ -27,10 +31,60 @@ hailo_logger = get_logger(__name__)
 # -----------------------------------------------------------------------------------------------
 # User-defined class to be used in the callback function
 # -----------------------------------------------------------------------------------------------
+def _parse_line_norm(s: str):
+    # Accept "x1,y1,x2,y2" normalized to [0..1]
+    parts = [p.strip() for p in s.split(",")]
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError("--line must be 'x1,y1,x2,y2' (normalized 0..1)")
+    vals = tuple(float(v) for v in parts)
+    if any(v < 0.0 or v > 1.0 for v in vals):
+        raise argparse.ArgumentTypeError("--line values must be in [0..1]")
+    if vals[0] == vals[2] and vals[1] == vals[3]:
+        raise argparse.ArgumentTypeError("--line points must not be identical")
+    return vals
+
+
+def _line_points_px(line_norm, width, height):
+    x1n, y1n, x2n, y2n = line_norm
+    return (int(x1n * width), int(y1n * height)), (int(x2n * width), int(y2n * height))
+
+
+def _point_side_of_line(p1, p2, q):
+    """Signed side test for directed line p1->p2. >0 left, <0 right, 0 on line."""
+    x1, y1 = p1
+    x2, y2 = p2
+    x, y = q
+    dx = x2 - x1
+    dy = y2 - y1
+    return dx * (y - y1) - dy * (x - x1)
+
+
+def _bbox_intersects_infinite_line(p1, p2, xyxy):
+    """Return True if bbox corners lie on different sides of the line (or on the line)."""
+    x1, y1, x2, y2 = xyxy
+    corners = ((x1, y1), (x2, y1), (x2, y2), (x1, y2))
+    has_pos = False
+    has_neg = False
+    for c in corners:
+        s = _point_side_of_line(p1, p2, c)
+        if s > 0:
+            has_pos = True
+        elif s < 0:
+            has_neg = True
+        else:
+            return True
+    return has_pos and has_neg
+
+
 class user_app_callback_class(app_callback_class):
-    def __init__(self):
+    def __init__(self, line_norm, red_side, red_if_crossing):
         super().__init__()
         self.new_variable = 42
+
+        # Defaults (can be overridden by CLI args parsed in main)
+        self.line_norm = line_norm  # (x1,y1,x2,y2) normalized to [0..1]
+        self.red_side = red_side  # 'left' or 'right' relative to directed line (p1->p2)
+        self.red_if_crossing = red_if_crossing
 
     def new_function(self):
         return "The meaning of life is: "
@@ -96,24 +150,37 @@ def app_callback(element, buffer, user_data):
     detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
 
     detection_count = 0
-    line_x = int(0.5 * width) if width is not None else None
+
+    p1 = p2 = None
+    if width is not None and height is not None:
+        try:
+            p1, p2 = _line_points_px(user_data.line_norm, width, height)
+        except Exception:
+            p1 = p2 = None
+
     for detection in detections:
         label = detection.get_label()
         confidence = detection.get_confidence()
 
         xyxy = None
-        is_right = False
         is_crossing = False
-        if line_x is not None and height is not None:
+        is_red = False
+        if p1 is not None and p2 is not None and height is not None:
             xyxy = _get_detection_bbox_xyxy(detection, width, height)
             if xyxy is not None:
                 x1, y1, x2, y2 = xyxy
-                is_crossing = x1 <= line_x <= x2
-                # Entire bbox is to the right of the line
-                is_right = x1 >= line_x
+                cx = int((x1 + x2) / 2)
+                cy = int((y1 + y2) / 2)
 
-        # Red only if fully to the right
-        is_red = is_right
+                side = _point_side_of_line(p1, p2, (cx, cy))
+                if user_data.red_side == "left":
+                    is_red = side > 0
+                else:
+                    is_red = side < 0
+
+                is_crossing = _bbox_intersects_infinite_line(p1, p2, xyxy)
+                if user_data.red_if_crossing and is_crossing:
+                    is_red = True
 
         # Get track ID
         track_id = 0
@@ -123,7 +190,7 @@ def app_callback(element, buffer, user_data):
 
         if is_crossing:
             _print_red(
-                f"CROSSED line_x={line_x} | ID={track_id} | Label={label} | Conf={confidence:.2f}"
+                f"CROSSED line | ID={track_id} | Label={label} | Conf={confidence:.2f}"
             )
 
         # Draw bbox (frame is RGB here)
@@ -132,8 +199,9 @@ def app_callback(element, buffer, user_data):
             color = (255, 0, 0) if is_red else (0, 255, 0)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-            # Draw track ID label above the box
-            label_text = f"ID:{track_id}"
+            # Draw label + track ID above the box
+            safe_label = label if label is not None else ""
+            label_text = f"{safe_label} ID:{track_id}".strip()
             text_scale = 0.6
             text_thickness = 2
             (tw, th), baseline = cv2.getTextSize(
@@ -141,7 +209,6 @@ def app_callback(element, buffer, user_data):
             )
             tx = max(0, x1)
             ty = max(th + 2, y1 - 4)
-            # background for readability
             cv2.rectangle(
                 frame,
                 (tx, ty - th - baseline - 2),
@@ -185,10 +252,8 @@ def app_callback(element, buffer, user_data):
             2,
         )
 
-        # Draw a vertical reference line overlay (frame is RGB here)
-        if frame is not None and line_x is not None and height is not None:
-            p1 = (line_x, int(0.1 * height))
-            p2 = (line_x, int(0.9 * height))
+        # Draw the user-defined angled line
+        if frame is not None and p1 is not None and p2 is not None:
             cv2.line(frame, p1, p2, (255, 0, 0), 2)
 
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
@@ -200,8 +265,30 @@ def app_callback(element, buffer, user_data):
 
 def main():
     hailo_logger.info("Starting Detection App.")
-    user_data = user_app_callback_class()
-    app = GStreamerDetectionApp(app_callback, user_data)
+
+    parser = get_pipeline_parser()
+    parser.add_argument(
+        "--line",
+        type=_parse_line_norm,
+        default=(0.5, 0.1, 0.5, 0.9),
+        help="Directed line defined by normalized coordinates x1,y1,x2,y2 (0..1) for red detection",
+    )
+    parser.add_argument(
+        "--red-side",
+        type=str,
+        choices=["left", "right"],
+        default="right",
+        help="Which side of the line to mark as red (relative to directed line p1->p2)",
+    )
+    parser.add_argument(
+        "--red-if-crossing",
+        action="store_true",
+        default=False,
+        help="Mark as red if bbox crosses the line, regardless of which side the center is on",
+    )
+    user_data = user_app_callback_class(
+        line_norm=parser.parse_args().line, red_side=parser.parse_args().red_side, red_if_crossing=parser.parse_args().red_if_crossing)
+    app = GStreamerDetectionApp(app_callback, user_data, parser)
     app.run()
 
 
