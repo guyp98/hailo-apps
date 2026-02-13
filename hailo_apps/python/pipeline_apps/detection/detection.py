@@ -296,4 +296,4 @@ if __name__ == "__main__":
     main()
 
 #running example
-#python3  hailo_apps.python.pipeline_apps.detection.detection --line 0.1,0.1,0.9,0.9 --red-side right --red-if-crossing`
+#python3  hailo_apps.python.pipeline_apps.detection.detection --use-frame --line 0.1,0.1,0.9,0.9 --red-side right --red-if-crossing --input /dev/video0
