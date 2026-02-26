@@ -77,7 +77,7 @@ def _bbox_intersects_infinite_line(p1, p2, xyxy):
 
 
 class user_app_callback_class(app_callback_class):
-    def __init__(self, line_norm, red_side, red_if_crossing):
+    def __init__(self, line_norm, red_side, red_if_crossing, filter_labels=None):
         super().__init__()
         self.new_variable = 42
 
@@ -85,6 +85,7 @@ class user_app_callback_class(app_callback_class):
         self.line_norm = line_norm  # (x1,y1,x2,y2) normalized to [0..1]
         self.red_side = red_side  # 'left' or 'right' relative to directed line (p1->p2)
         self.red_if_crossing = red_if_crossing
+        self.filter_labels = set(filter_labels) if filter_labels else None
 
     def new_function(self):
         return "The meaning of life is: "
@@ -98,6 +99,11 @@ class user_app_callback_class(app_callback_class):
 def _print_red(msg: str):
     # ANSI 24-bit red
     print(f"\x1b[38;2;255;0;0m{msg}\x1b[0m")
+
+
+def _print_green(msg: str):
+    # ANSI 24-bit green
+    print(f"\x1b[38;2;0;255;0m{msg}\x1b[0m")
 
 
 def _get_detection_bbox_xyxy(detection, width, height):
@@ -162,6 +168,10 @@ def app_callback(element, buffer, user_data):
         label = detection.get_label()
         confidence = detection.get_confidence()
 
+        # Skip detections not in the filter list
+        if user_data.filter_labels and label not in user_data.filter_labels:
+            continue
+
         xyxy = None
         is_crossing = False
         is_red = False
@@ -191,6 +201,10 @@ def app_callback(element, buffer, user_data):
         if is_crossing:
             _print_red(
                 f"CROSSED line | ID={track_id} | Label={label} | Conf={confidence:.2f}"
+            )
+        else:
+            _print_green(
+                f"OK | ID={track_id} | Label={label} | Conf={confidence:.2f}"
             )
 
         # Draw bbox (frame is RGB here)
@@ -286,8 +300,17 @@ def main():
         default=False,
         help="Mark as red if bbox crosses the line, regardless of which side the center is on",
     )
+    parser.add_argument(
+        "--filter-labels",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Only show detections with these labels (e.g. --filter-labels person car)",
+    )
+    args = parser.parse_args()
     user_data = user_app_callback_class(
-        line_norm=parser.parse_args().line, red_side=parser.parse_args().red_side, red_if_crossing=parser.parse_args().red_if_crossing)
+        line_norm=args.line, red_side=args.red_side,
+        red_if_crossing=args.red_if_crossing, filter_labels=args.filter_labels)
     app = GStreamerDetectionApp(app_callback, user_data, parser)
     app.run()
 
