@@ -1,12 +1,15 @@
 # region imports
 # Standard library imports
 import argparse
+import time
 
 # Third-party imports
 import gi
 
 gi.require_version("Gst", "1.0")
 import cv2
+import numpy as np
+import yaml
 
 # Local application-specific imports
 import hailo
@@ -31,64 +34,74 @@ hailo_logger = get_logger(__name__)
 # -----------------------------------------------------------------------------------------------
 # User-defined class to be used in the callback function
 # -----------------------------------------------------------------------------------------------
-def _parse_line_norm(s: str):
-    # Accept "x1,y1,x2,y2" normalized to [0..1]
+def _parse_zone_norm(s: str):
+    """Parse 'x1,y1,x2,y2,x3,y3,...' into list of (x,y) tuples, normalized to [0..1]."""
     parts = [p.strip() for p in s.split(",")]
-    if len(parts) != 4:
-        raise argparse.ArgumentTypeError("--line must be 'x1,y1,x2,y2' (normalized 0..1)")
-    vals = tuple(float(v) for v in parts)
+    if len(parts) < 6 or len(parts) % 2 != 0:
+        raise argparse.ArgumentTypeError(
+            "--zone must be 'x1,y1,x2,y2,x3,y3,...' with at least 3 vertices (6 values)"
+        )
+    vals = [float(v) for v in parts]
     if any(v < 0.0 or v > 1.0 for v in vals):
-        raise argparse.ArgumentTypeError("--line values must be in [0..1]")
-    if vals[0] == vals[2] and vals[1] == vals[3]:
-        raise argparse.ArgumentTypeError("--line points must not be identical")
-    return vals
+        raise argparse.ArgumentTypeError("--zone values must be in [0..1]")
+    return [(vals[i], vals[i + 1]) for i in range(0, len(vals), 2)]
 
 
-def _line_points_px(line_norm, width, height):
-    x1n, y1n, x2n, y2n = line_norm
-    return (int(x1n * width), int(y1n * height)), (int(x2n * width), int(y2n * height))
+def _load_detection_config(config_path):
+    """Load detection-specific settings from a YAML file.
+
+    Returns dict with keys: zone, dwell_threshold, filter_labels.
+    Missing keys are not included (caller uses CLI defaults).
+    """
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f) or {}
+    result = {}
+    if "zone" in cfg and cfg["zone"] is not None:
+        result["zone"] = [(float(p[0]), float(p[1])) for p in cfg["zone"]]
+    if "dwell_threshold" in cfg:
+        result["dwell_threshold"] = float(cfg["dwell_threshold"])
+    if "filter_labels" in cfg and cfg["filter_labels"] is not None:
+        result["filter_labels"] = [str(l) for l in cfg["filter_labels"]]
+    return result
 
 
-def _point_side_of_line(p1, p2, q):
-    """Signed side test for directed line p1->p2. >0 left, <0 right, 0 on line."""
-    x1, y1 = p1
-    x2, y2 = p2
-    x, y = q
-    dx = x2 - x1
-    dy = y2 - y1
-    return dx * (y - y1) - dy * (x - x1)
+def _zone_points_px(zone_norm, width, height):
+    """Convert normalized zone vertices to pixel coordinates."""
+    return [(int(x * width), int(y * height)) for x, y in zone_norm]
 
 
-def _bbox_intersects_infinite_line(p1, p2, xyxy):
-    """Return True if bbox corners lie on different sides of the line (or on the line)."""
-    x1, y1, x2, y2 = xyxy
-    corners = ((x1, y1), (x2, y1), (x2, y2), (x1, y2))
-    has_pos = False
-    has_neg = False
-    for c in corners:
-        s = _point_side_of_line(p1, p2, c)
-        if s > 0:
-            has_pos = True
-        elif s < 0:
-            has_neg = True
-        else:
-            return True
-    return has_pos and has_neg
+def _point_in_polygon(polygon, point):
+    """Ray casting algorithm. Returns True if point is inside polygon."""
+    x, y = point
+    n = len(polygon)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = polygon[i]
+        xj, yj = polygon[j]
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
 
 
 class user_app_callback_class(app_callback_class):
-    def __init__(self, line_norm, red_side, red_if_crossing, filter_labels=None):
+    def __init__(self, zone_norm=None, dwell_threshold=10, filter_labels=None):
         super().__init__()
-        self.new_variable = 42
-
-        # Defaults (can be overridden by CLI args parsed in main)
-        self.line_norm = line_norm  # (x1,y1,x2,y2) normalized to [0..1]
-        self.red_side = red_side  # 'left' or 'right' relative to directed line (p1->p2)
-        self.red_if_crossing = red_if_crossing
+        self.zone_norm = zone_norm  # list of (x,y) normalized tuples or None
+        self.dwell_threshold = dwell_threshold  # seconds before loitering alert
         self.filter_labels = set(filter_labels) if filter_labels else None
+        # Dwell tracking: {track_id: first_seen_timestamp}
+        self.dwell_tracker = {}
+        # Track IDs that have already triggered a loitering alert (print once)
+        self.dwell_alerted = set()
 
-    def new_function(self):
-        return "The meaning of life is: "
+    def cleanup_stale_ids(self, active_ids):
+        """Remove track IDs no longer detected to keep memory bounded."""
+        stale = set(self.dwell_tracker.keys()) - active_ids
+        for tid in stale:
+            del self.dwell_tracker[tid]
+            self.dwell_alerted.discard(tid)
 
 
 # -----------------------------------------------------------------------------------------------
@@ -104,6 +117,11 @@ def _print_red(msg: str):
 def _print_green(msg: str):
     # ANSI 24-bit green
     print(f"\x1b[38;2;0;255;0m{msg}\x1b[0m")
+
+
+def _print_orange(msg: str):
+    # ANSI 24-bit orange
+    print(f"\x1b[38;2;255;165;0m{msg}\x1b[0m")
 
 
 def _get_detection_bbox_xyxy(detection, width, height):
@@ -142,7 +160,6 @@ def app_callback(element, buffer, user_data):
         return
 
     # Note: Frame counting is handled automatically by the framework wrapper
-    frame_idx = user_data.get_count()
     string_to_print = f"Frame count: {user_data.get_count()}\n"
 
     pad = element.get_static_pad("src")
@@ -156,13 +173,14 @@ def app_callback(element, buffer, user_data):
     detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
 
     detection_count = 0
+    now = time.time()
 
-    p1 = p2 = None
-    if width is not None and height is not None:
-        try:
-            p1, p2 = _line_points_px(user_data.line_norm, width, height)
-        except Exception:
-            p1 = p2 = None
+    # Convert zone to pixel coordinates once per frame
+    zone_px = None
+    if user_data.zone_norm and width is not None and height is not None:
+        zone_px = _zone_points_px(user_data.zone_norm, width, height)
+
+    active_ids = set()
 
     for detection in detections:
         label = detection.get_label()
@@ -172,37 +190,52 @@ def app_callback(element, buffer, user_data):
         if user_data.filter_labels and label not in user_data.filter_labels:
             continue
 
-        xyxy = None
-        is_crossing = False
-        is_red = False
-        if p1 is not None and p2 is not None and height is not None:
-            xyxy = _get_detection_bbox_xyxy(detection, width, height)
-            if xyxy is not None:
-                x1, y1, x2, y2 = xyxy
-                cx = int((x1 + x2) / 2)
-                cy = int((y1 + y2) / 2)
-
-                side = _point_side_of_line(p1, p2, (cx, cy))
-                if user_data.red_side == "left":
-                    is_red = side > 0
-                else:
-                    is_red = side < 0
-
-                is_crossing = _bbox_intersects_infinite_line(p1, p2, xyxy)
-                if user_data.red_if_crossing and is_crossing:
-                    is_red = True
-
         # Get track ID
         track_id = 0
         track = detection.get_objects_typed(hailo.HAILO_UNIQUE_ID)
         if len(track) == 1:
             track_id = track[0].get_id()
+        active_ids.add(track_id)
 
-        if is_crossing:
+        xyxy = _get_detection_bbox_xyxy(detection, width, height)
+
+        # Zone logic
+        in_zone = False
+        is_loitering = False
+        if zone_px is not None and xyxy is not None:
+            x1, y1, x2, y2 = xyxy
+            cx = int((x1 + x2) / 2)
+            cy = int((y1 + y2) / 2)
+            in_zone = _point_in_polygon(zone_px, (cx, cy))
+
+            # Dwell tracking
+            if in_zone:
+                if track_id not in user_data.dwell_tracker:
+                    user_data.dwell_tracker[track_id] = now
+                dwell_time = now - user_data.dwell_tracker[track_id]
+                if dwell_time >= user_data.dwell_threshold:
+                    is_loitering = True
+                    if track_id not in user_data.dwell_alerted:
+                        user_data.dwell_alerted.add(track_id)
+                        _print_orange(
+                            f"LOITERING | ID={track_id} | Label={label} | "
+                            f"Dwell={dwell_time:.1f}s"
+                        )
+            else:
+                # Left the zone — reset dwell tracking
+                user_data.dwell_tracker.pop(track_id, None)
+                user_data.dwell_alerted.discard(track_id)
+
+        # Determine color and print
+        if is_loitering:
+            color = (255, 165, 0)  # orange
+        elif in_zone:
+            color = (255, 0, 0)  # red
             _print_red(
-                f"CROSSED line | ID={track_id} | Label={label} | Conf={confidence:.2f}"
+                f"IN ZONE | ID={track_id} | Label={label} | Conf={confidence:.2f}"
             )
         else:
+            color = (0, 255, 0)  # green
             _print_green(
                 f"OK | ID={track_id} | Label={label} | Conf={confidence:.2f}"
             )
@@ -210,12 +243,14 @@ def app_callback(element, buffer, user_data):
         # Draw bbox (frame is RGB here)
         if frame is not None and xyxy is not None:
             x1, y1, x2, y2 = xyxy
-            color = (255, 0, 0) if is_red else (0, 255, 0)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
             # Draw label + track ID above the box
             safe_label = label if label is not None else ""
             label_text = f"{safe_label} ID:{track_id}".strip()
+            if is_loitering:
+                dwell_time = now - user_data.dwell_tracker.get(track_id, now)
+                label_text += f" {dwell_time:.0f}s"
             text_scale = 0.6
             text_thickness = 2
             (tw, th), baseline = cv2.getTextSize(
@@ -241,12 +276,15 @@ def app_callback(element, buffer, user_data):
                 cv2.LINE_AA,
             )
 
-        if label == "person":
-            string_to_print += (
-                f"Detection: ID: {track_id} Label: {label} Confidence: {confidence:.2f}\n"
-            )
-            detection_count += 1
-    if user_data.use_frame:
+        string_to_print += (
+            f"Detection: ID: {track_id} Label: {label} Confidence: {confidence:.2f}\n"
+        )
+        detection_count += 1
+
+    # Cleanup stale track IDs
+    user_data.cleanup_stale_ids(active_ids)
+
+    if user_data.use_frame and frame is not None:
         cv2.putText(
             frame,
             f"Detections: {detection_count}",
@@ -256,19 +294,11 @@ def app_callback(element, buffer, user_data):
             (0, 255, 0),
             2,
         )
-        cv2.putText(
-            frame,
-            f"{user_data.new_function()} {user_data.new_variable}",
-            (10, 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 255, 0),
-            2,
-        )
 
-        # Draw the user-defined angled line
-        if frame is not None and p1 is not None and p2 is not None:
-            cv2.line(frame, p1, p2, (255, 0, 0), 2)
+        # Draw zone polygon
+        if zone_px is not None:
+            pts = np.array(zone_px, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(frame, [pts], isClosed=True, color=(0, 255, 255), thickness=2)
 
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         user_data.set_frame(frame)
@@ -282,23 +312,22 @@ def main():
 
     parser = get_pipeline_parser()
     parser.add_argument(
-        "--line",
-        type=_parse_line_norm,
-        default=(0.5, 0.1, 0.5, 0.9),
-        help="Directed line defined by normalized coordinates x1,y1,x2,y2 (0..1) for red detection",
-    )
-    parser.add_argument(
-        "--red-side",
+        "--config",
         type=str,
-        choices=["left", "right"],
-        default="right",
-        help="Which side of the line to mark as red (relative to directed line p1->p2)",
+        default=None,
+        help="Path to YAML config file for detection settings (zone, dwell_threshold, filter_labels). CLI args override config values.",
     )
     parser.add_argument(
-        "--red-if-crossing",
-        action="store_true",
-        default=False,
-        help="Mark as red if bbox crosses the line, regardless of which side the center is on",
+        "--zone",
+        type=_parse_zone_norm,
+        default=None,
+        help="Polygon zone as normalized coords: x1,y1,x2,y2,x3,y3,... (0..1, min 3 vertices)",
+    )
+    parser.add_argument(
+        "--dwell-threshold",
+        type=float,
+        default=None,
+        help="Seconds before an in-zone object is flagged as loitering (default: 10)",
     )
     parser.add_argument(
         "--filter-labels",
@@ -307,10 +336,24 @@ def main():
         default=None,
         help="Only show detections with these labels (e.g. --filter-labels person car)",
     )
+
+    # Load YAML config as defaults (CLI args override)
+    pre_args, _ = parser.parse_known_args()
+    if pre_args.config:
+        hailo_logger.info("Loading detection config from %s", pre_args.config)
+        cfg = _load_detection_config(pre_args.config)
+        parser.set_defaults(**cfg)
+
     args = parser.parse_args()
+
+    # Apply default for dwell_threshold after merge
+    dwell_threshold = args.dwell_threshold if args.dwell_threshold is not None else 10
+
     user_data = user_app_callback_class(
-        line_norm=args.line, red_side=args.red_side,
-        red_if_crossing=args.red_if_crossing, filter_labels=args.filter_labels)
+        zone_norm=args.zone,
+        dwell_threshold=dwell_threshold,
+        filter_labels=args.filter_labels,
+    )
     app = GStreamerDetectionApp(app_callback, user_data, parser)
     app.run()
 
@@ -318,5 +361,10 @@ def main():
 if __name__ == "__main__":
     main()
 
-#running example
-#python3  hailo_apps.python.pipeline_apps.detection.detection --use-frame --line 0.1,0.1,0.9,0.9 --red-side right --red-if-crossing --input /dev/video0
+# Running examples:
+# Using YAML config file:
+#   python3 detection.py --config detection_config_example.yaml --show-frame --input /dev/video8
+# Config file with CLI override:
+#   python3 detection.py --config detection_config_example.yaml --dwell-threshold 3 --input /dev/video8
+# Pure CLI (no config file):
+#   python3 detection.py --show-frame --zone 0.1,0.1,0.9,0.1,0.9,0.9,0.1,0.9 --dwell-threshold 5 --input /dev/video8

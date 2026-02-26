@@ -1,0 +1,19 @@
+# Detection configuration example
+# Usage: python3 detection.py --config detection_config_example.yaml --show-frame --input /dev/video8
+# CLI args override values in this file.
+
+# Polygon zone defined as a list of [x, y] normalized coordinates (0..1).
+# Minimum 3 vertices. The polygon is automatically closed.
+# Example: rectangle covering the center of the frame
+zone:
+  - [0.2, 0.2]
+  - [0.8, 0.2]
+  - [0.8, 0.8]
+  - [0.2, 0.8]
+
+# Seconds an object must stay inside the zone before it is flagged as loitering.
+dwell_threshold: 10
+
+# Only process detections with these labels. Remove or set to null to show all.
+filter_labels:
+  - person
