@@ -131,6 +131,16 @@ def get_pipeline_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--show-frame",
+        action="store_true",
+        help=(
+            "Display callback frames in a window. "
+            "Implies --use-frame. When enabled, frames processed in the callback "
+            "are shown in a separate OpenCV window."
+        ),
+    )
+
+    parser.add_argument(
         "--disable-sync",
         action="store_true",
         help=(

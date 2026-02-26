@@ -338,7 +338,11 @@ class GStreamerApp:
 
         self.app_callback = None
 
+        # If --show-frame is set, auto-enable use_frame
+        if self.options_menu.show_frame:
+            self.options_menu.use_frame = True
         user_data.use_frame = self.options_menu.use_frame
+        self.show_frame = self.options_menu.show_frame
 
         self.sync = (
             "true" if (self.source_type == "file" and not self.options_menu.disable_sync) else "false"
@@ -676,7 +680,7 @@ class GStreamerApp:
 
         disable_qos(self.pipeline)
 
-        if self.options_menu.use_frame:
+        if self.show_frame:
             hailo_logger.debug("Starting display_user_data_frame process")
             display_process = multiprocessing.Process(
                 target=display_user_data_frame, args=(self.user_data,)
@@ -711,7 +715,7 @@ class GStreamerApp:
             hailo_logger.debug("Cleaning up after loop exit")
             self.user_data.running = False
             self.pipeline.set_state(Gst.State.NULL)
-            if self.options_menu.use_frame:
+            if self.show_frame:
                 display_process.terminate()
                 display_process.join()
             for t in self.threads:
