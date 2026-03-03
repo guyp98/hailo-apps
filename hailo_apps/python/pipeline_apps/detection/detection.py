@@ -262,6 +262,11 @@ def app_callback(element, buffer, user_data):
         # Determine color and print
         if is_loitering:
             color = (255, 165, 0)  # orange
+            dwell_time = now - user_data.dwell_tracker.get(track_id, now)
+            _print_orange(
+                f"LOITERING | ID={track_id} | Label={label} | "
+                f"Dwell={dwell_time:.1f}s | Conf={confidence:.2f}"
+            )
         elif in_zone:
             color = (255, 0, 0)  # red
             _print_red(
