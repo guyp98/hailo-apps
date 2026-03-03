@@ -17,3 +17,7 @@ dwell_threshold: 10
 # Only process detections with these labels. Remove or set to null to show all.
 filter_labels:
   - person
+
+# GPIO pin to drive HIGH when any detection is inside the zone.
+# Requires the lgpio library. Remove or set to null to disable.
+gpio_pin: 23

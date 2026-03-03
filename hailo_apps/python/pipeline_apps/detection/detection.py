@@ -62,6 +62,8 @@ def _load_detection_config(config_path):
         result["dwell_threshold"] = float(cfg["dwell_threshold"])
     if "filter_labels" in cfg and cfg["filter_labels"] is not None:
         result["filter_labels"] = [str(l) for l in cfg["filter_labels"]]
+    if "gpio_pin" in cfg and cfg["gpio_pin"] is not None:
+        result["gpio_pin"] = int(cfg["gpio_pin"])
     return result
 
 
@@ -86,7 +88,7 @@ def _point_in_polygon(polygon, point):
 
 
 class user_app_callback_class(app_callback_class):
-    def __init__(self, zone_norm=None, dwell_threshold=10, filter_labels=None):
+    def __init__(self, zone_norm=None, dwell_threshold=10, filter_labels=None, gpio_pin=None):
         super().__init__()
         self.zone_norm = zone_norm  # list of (x,y) normalized tuples or None
         self.dwell_threshold = dwell_threshold  # seconds before loitering alert
@@ -95,6 +97,37 @@ class user_app_callback_class(app_callback_class):
         self.dwell_tracker = {}
         # Track IDs that have already triggered a loitering alert (print once)
         self.dwell_alerted = set()
+        # GPIO output: pin driven HIGH when any detection is in the zone
+        self.gpio_pin = gpio_pin
+        self._gpio_handle = None
+        self._gpio_state = False
+        if gpio_pin is not None:
+            self._gpio_init()
+
+    def _gpio_init(self):
+        import lgpio
+        self._lgpio = lgpio
+        self._gpio_handle = lgpio.gpiochip_open(0)
+        lgpio.gpio_claim_output(self._gpio_handle, self.gpio_pin)
+        lgpio.gpio_write(self._gpio_handle, self.gpio_pin, 0)
+        hailo_logger.info("GPIO pin %d configured as output (active-high)", self.gpio_pin)
+
+    def gpio_set(self, active):
+        """Set GPIO pin HIGH (active=True) or LOW (active=False)."""
+        if self._gpio_handle is None:
+            return
+        if active != self._gpio_state:
+            self._lgpio.gpio_write(self._gpio_handle, self.gpio_pin, int(active))
+            self._gpio_state = active
+
+    def gpio_cleanup(self):
+        if self._gpio_handle is None:
+            return
+        self._lgpio.gpio_write(self._gpio_handle, self.gpio_pin, 0)
+        self._lgpio.gpio_free(self._gpio_handle, self.gpio_pin)
+        self._lgpio.gpiochip_close(self._gpio_handle)
+        self._gpio_handle = None
+        hailo_logger.info("GPIO pin %d released", self.gpio_pin)
 
     def cleanup_stale_ids(self, active_ids):
         """Remove track IDs no longer detected to keep memory bounded."""
@@ -284,6 +317,10 @@ def app_callback(element, buffer, user_data):
     # Cleanup stale track IDs
     user_data.cleanup_stale_ids(active_ids)
 
+    # Drive GPIO: HIGH if any detection is currently in the zone
+    any_in_zone = any(tid in user_data.dwell_tracker for tid in active_ids)
+    user_data.gpio_set(any_in_zone)
+
     if user_data.use_frame and frame is not None:
         cv2.putText(
             frame,
@@ -336,6 +373,12 @@ def main():
         default=None,
         help="Only show detections with these labels (e.g. --filter-labels person car)",
     )
+    parser.add_argument(
+        "--gpio-pin",
+        type=int,
+        default=None,
+        help="GPIO pin number to drive HIGH when a detection is inside the zone (requires lgpio)",
+    )
 
     # Load YAML config as defaults (CLI args override)
     pre_args, _ = parser.parse_known_args()
@@ -353,9 +396,13 @@ def main():
         zone_norm=args.zone,
         dwell_threshold=dwell_threshold,
         filter_labels=args.filter_labels,
+        gpio_pin=args.gpio_pin,
     )
     app = GStreamerDetectionApp(app_callback, user_data, parser)
-    app.run()
+    try:
+        app.run()
+    finally:
+        user_data.gpio_cleanup()
 
 
 if __name__ == "__main__":
@@ -368,3 +415,5 @@ if __name__ == "__main__":
 #   python3 detection.py --config detection_config_example.yaml --dwell-threshold 3 --input /dev/video8
 # Pure CLI (no config file):
 #   python3 detection.py --show-frame --zone 0.1,0.1,0.9,0.1,0.9,0.9,0.1,0.9 --dwell-threshold 5 --input /dev/video8
+# With GPIO output on pin 23 (light turns on when someone is in the zone):
+#   python3 detection.py --config detection_config_example.yaml --gpio-pin 23 --input /dev/video8
